@@ -1,0 +1,204 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Numerics;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+const string Wallet = MinerConfig.Wallet;
+const string Pool = MinerConfig.Pool;
+const string Worker = MinerConfig.Worker;
+const string MinerResourceName = "PearlMine.miner.exe";
+
+Console.OutputEncoding = Encoding.UTF8;
+Console.Title = "Pearl (PRL) 채굴 대시보드";
+TrySetConsoleSize();
+TrySetCursorVisibility(false);
+
+var state = new DashboardState();
+var renderer = new DashboardRenderer();
+var extractionDirectory = Path.Combine(Path.GetTempPath(), $"PearlMine-{Environment.ProcessId}");
+var minerPath = Path.Combine(extractionDirectory, "miner.exe");
+using var shutdown = new CancellationTokenSource();
+
+Process? miner = null;
+Task? stdoutTask = null;
+Task? stderrTask = null;
+Task? poolTask = null;
+var stopRequested = 0;
+
+try
+{
+    state.SetStatus("포함된 공식 채굴기 준비 중");
+    renderer.Render(state.GetSnapshot());
+
+    Directory.CreateDirectory(extractionDirectory);
+    await ExtractEmbeddedMinerAsync(minerPath);
+
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = minerPath,
+        WorkingDirectory = extractionDirectory,
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true,
+        StandardOutputEncoding = Encoding.UTF8,
+        StandardErrorEncoding = Encoding.UTF8
+    };
+    startInfo.ArgumentList.Add("--proxy");
+    startInfo.ArgumentList.Add(Pool);
+    startInfo.ArgumentList.Add("--address");
+    startInfo.ArgumentList.Add(Wallet);
+    startInfo.ArgumentList.Add("--worker");
+    startInfo.ArgumentList.Add(Worker);
+
+    miner = Process.Start(startInfo) ?? throw new InvalidOperationException("공식 채굴기를 시작하지 못했습니다.");
+    state.SetStatus("채굴기 시작됨 · 풀 연결과 작업 수신 대기 중");
+
+    stdoutTask = CaptureMinerOutputAsync(miner.StandardOutput, state, "OUT");
+    stderrTask = CaptureMinerOutputAsync(miner.StandardError, state, "ERR");
+    poolTask = PollPoolAsync(state, shutdown.Token);
+
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        if (Interlocked.Exchange(ref stopRequested, 1) != 0) return;
+
+        state.SetStatus("중지 요청됨 · 공식 채굴기를 종료하는 중");
+        shutdown.Cancel();
+        try
+        {
+            if (miner is { HasExited: false }) miner.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException)
+        {
+            // The process completed between the check and the stop request.
+        }
+    };
+
+    var exitTask = miner.WaitForExitAsync();
+    while (!exitTask.IsCompleted)
+    {
+        renderer.Render(state.GetSnapshot());
+        await Task.WhenAny(exitTask, Task.Delay(350));
+    }
+
+    await exitTask;
+    shutdown.Cancel();
+    await AwaitQuietlyAsync(stdoutTask, stderrTask, poolTask);
+
+    state.SetStatus(stopRequested == 1
+        ? "채굴이 중지되었습니다"
+        : $"채굴기가 종료되었습니다 · 종료 코드 {miner.ExitCode}");
+    renderer.Render(state.GetSnapshot());
+    TryCleanExtraction(extractionDirectory);
+    WaitBeforeClose("아무 키나 누르면 창을 닫습니다.");
+    return miner.ExitCode;
+}
+catch (Exception ex)
+{
+    shutdown.Cancel();
+    if (miner is { HasExited: false })
+    {
+        try { miner.Kill(entireProcessTree: true); }
+        catch (InvalidOperationException) { }
+    }
+
+    await AwaitQuietlyAsync(stdoutTask, stderrTask, poolTask);
+    state.AddLog($"[오류] {ex.Message}");
+    state.SetStatus("시작하지 못했습니다");
+    renderer.Render(state.GetSnapshot());
+    TryCleanExtraction(extractionDirectory);
+    WaitBeforeClose("아무 키나 누르면 창을 닫습니다.");
+    return 1;
+}
+finally
+{
+    TrySetCursorVisibility(true);
+}
+
+static async Task ExtractEmbeddedMinerAsync(string targetPath)
+{
+    await using var embeddedMiner = Assembly.GetExecutingAssembly().GetManifestResourceStream(MinerResourceName)
+        ?? throw new FileNotFoundException("포함된 공식 채굴기 파일을 찾지 못했습니다.");
+    await using var output = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None);
+    await embeddedMiner.CopyToAsync(output);
+}
+
+static async Task CaptureMinerOutputAsync(StreamReader reader, DashboardState state, string channel)
+{
+    while (await reader.ReadLineAsync() is { } rawLine)
+    {
+        var line = LogParser.Clean(rawLine);
+        if (line.Length == 0) continue;
+        state.RecordMinerLine($"[{channel}] {line}");
+    }
+}
+
+static async Task PollPoolAsync(DashboardState state, CancellationToken cancellationToken)
+{
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("PearlMineDashboard/1.0");
+
+    while (!cancellationToken.IsCancellationRequested)
+    {
+        await Task.WhenAll(
+            RefreshPpsBalanceAsync(http, state, cancellationToken),
+            RefreshConnectionAsync(http, state, cancellationToken),
+            RefreshRollingStatsAsync(http, state, cancellationToken));
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+    }
+}
+
+static async Task RefreshPpsBalanceAsync(HttpClient http, DashboardState state, CancellationToken cancellationToken)
+{
+    try
+    {
+        var root = await GetJsonAsync(http, $"https://pearlfortune.org/api/v1/miners/{Wallet}/pps?status=pending", cancellationToken);
+        if (!JsonHelpers.TryGetPath(root, out var data, "data")) throw new InvalidDataException("PPS 응답 형식이 다릅니다.");
+
+        state.SetPpsBalance(
+            JsonHelpers.Q64ToPrl(JsonHelpers.GetString(data, "immature_q64")),
+            JsonHelpers.AtomicToPrl(JsonHelpers.GetString(data, "balance_atomic")));
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+    }
+    catch
+    {
+        state.SetPpsUnavailable();
+    }
+}
+
+static async Task RefreshConnectionAsync(HttpClient http, DashboardState state, CancellationToken cancellationToken)
+{
+    try
+    {
+        var root = await GetJsonAsync(http, $"https://pearlfortune.org/api/v1/miners/{Wallet}/connections", cancellationToken);
+        if (!JsonHelpers.TryGetPath(root, out var data, "data")) throw new InvalidDataException("연결 응답 형식이 다릅니다.");
+
+        state.SetPoolConnection(JsonHelpers.GetBoolean(data, "online"), JsonHelpers.GetArrayLength(data, "workers"));
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+    }
+    catch
+    {
+        state.SetConnectionUnavailable();
+    }
+}
+
+static async Task RefreshRollingStatsAsync(DashboardState state, CancellationToken cancellationToken)
+{
+    // This method is called with HttpClient as its first argument below.
+}
